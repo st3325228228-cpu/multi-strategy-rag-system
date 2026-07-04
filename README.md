@@ -85,10 +85,6 @@ GROQ_API_KEY = "your-api-key"
 streamlit run streamlit_app.py
 ```
 
-## 線上展示
-
-[開啟 Multi-Strategy RAG System](https://stsfew-rag.hf.space)
-
 ## 專案目的
 
 本專案用於練習與展示以下能力：
