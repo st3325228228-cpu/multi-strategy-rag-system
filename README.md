@@ -1,3 +1,6 @@
+# Multi-Strategy RAG System
+
+
 使用 Python 與 Streamlit 建立的多策略 RAG 文件問答系統，可將 PDF 文件轉換為可檢索的知識庫，並結合向量搜尋、關鍵字搜尋與大型語言模型產生回答。
 
 ## 專案功能
