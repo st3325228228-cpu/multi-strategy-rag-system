@@ -118,3 +118,7 @@ streamlit run streamlit_app.py
 - 增加重新排序 Reranking
 - 加入使用者登入與知識庫管理
 - 使用 Docker 建立標準化部署環境
+
+## 線上展示
+
+[開啟 Multi-Strategy RAG System](https://multi-strategy-rag-system-qr2ct9faarcup2shvqozjr.streamlit.app)
