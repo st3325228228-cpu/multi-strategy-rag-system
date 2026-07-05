@@ -1,15 +1,15 @@
 """
-Streamlit + Groq API - 8種 RAG 策略 PDF 問答系統
-執行: streamlit run app.py
+Gradio + Groq API - 8種 RAG 策略 PDF 問答系統 (優化版)
+安裝: pip install gradio groq pypdf sentence-transformers numpy faiss-cpu scikit-learn
 """
 
 import os
 import logging
 import re
-import tempfile
 from typing import Optional
+from functools import lru_cache
 
-import streamlit as st
+import gradio as gr
 import numpy as np
 import faiss
 from groq import Groq
@@ -31,17 +31,6 @@ SMALL_CHUNK_SIZE = 300
 SMALL_CHUNK_OVERLAP = 50
 
 
-# ══════════════════════════════════════════════════════════
-#  快取：Embedding 模型只載入一次
-# ══════════════════════════════════════════════════════════
-@st.cache_resource(show_spinner="🔄 首次載入 Embedding 模型中…")
-def load_embedding_model() -> SentenceTransformer:
-    return SentenceTransformer(EMBEDDING_MODEL_NAME)
-
-
-# ══════════════════════════════════════════════════════════
-#  RAG 引擎核心類別
-# ══════════════════════════════════════════════════════════
 class MultiStrategyRAG:
     """支援 8 種 RAG 策略的 PDF 問答引擎"""
 
@@ -55,28 +44,41 @@ class MultiStrategyRAG:
         self.tfidf_matrix = None
         self.pdf_loaded = False
 
-    # ── API Key ───────────────────────────────────────────
-    def set_api_key(self, api_key: str) -> tuple[bool, str]:
+    # ── 初始化 ────────────────────────────────────────────
+
+    def set_api_key(self, api_key: str) -> str:
+        """設定 Groq API Key"""
         api_key = api_key.strip()
         if not api_key:
-            return False, "❌ 請輸入有效的 API Key"
+            return "❌ 請輸入有效的 API Key"
         try:
             self.client = Groq(api_key=api_key)
+            # 驗證 key 是否有效
             self.client.chat.completions.create(
                 model=DEFAULT_MODEL,
                 messages=[{"role": "user", "content": "hi"}],
                 max_tokens=5,
             )
-            return True, "✅ API Key 驗證成功！"
+            return "✅ API Key 驗證成功！"
         except Exception as e:
             self.client = None
-            return False, f"❌ API Key 無效: {e}"
+            return f"❌ API Key 無效: {e}"
+
+    def _ensure_embedding_model(self):
+        """延遲載入 Embedding 模型（首次使用時才載入）"""
+        if self.embedding_model is None:
+            logger.info("載入 Embedding 模型中…")
+            self.embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+            logger.info("Embedding 模型載入完成")
 
     # ── PDF 載入 ──────────────────────────────────────────
-    def load_pdf(self, pdf_path: str) -> tuple[bool, str]:
+
+    def load_pdf(self, pdf_file) -> str:
+        if pdf_file is None:
+            return "⚠️ 請選擇 PDF 檔案"
         try:
-            self.embedding_model = load_embedding_model()
-            reader = PdfReader(pdf_path)
+            self._ensure_embedding_model()
+            reader = PdfReader(pdf_file)
 
             pages_text: list[str] = []
             for page in reader.pages:
@@ -85,41 +87,47 @@ class MultiStrategyRAG:
                     pages_text.append(text)
 
             if not pages_text:
-                return False, "❌ PDF 中未提取到任何文字（可能是掃描檔）"
+                return "❌ PDF 中未提取到任何文字（可能是掃描檔）"
 
             full_text = "\n".join(pages_text)
+
+            # 分割文本
             self.chunks = self._split_text(full_text, CHUNK_SIZE, CHUNK_OVERLAP)
             if not self.chunks:
-                return False, "❌ 文本分割後無有效片段"
+                return "❌ 文本分割後無有效片段"
 
+            # 生成嵌入向量 & 建立 FAISS 索引（使用內積，需先正規化）
             raw_embeddings = self.embedding_model.encode(
-                self.chunks, convert_to_numpy=True, show_progress_bar=False
+                self.chunks, convert_to_numpy=True, show_progress_bar=True
             )
             self.embeddings = normalize(raw_embeddings, norm="l2").astype("float32")
 
             dimension = self.embeddings.shape[1]
-            self.index = faiss.IndexFlatIP(dimension)
+            self.index = faiss.IndexFlatIP(dimension)  # 內積 = cosine（已正規化）
             self.index.add(self.embeddings)
 
+            # 建立 TF-IDF 索引
             self.tfidf_vectorizer = TfidfVectorizer(
                 max_features=3000, ngram_range=(1, 2)
             )
             self.tfidf_matrix = self.tfidf_vectorizer.fit_transform(self.chunks)
 
             self.pdf_loaded = True
-            msg = (
-                f"✅ 成功載入！共 {len(reader.pages)} 頁，"
+            return (
+                f"✅ 成功載入 PDF！共 {len(reader.pages)} 頁，"
                 f"提取 {len(pages_text)} 頁文字，分割為 {len(self.chunks)} 個片段"
             )
-            return True, msg
 
         except Exception as e:
             logger.exception("PDF 載入失敗")
-            return False, f"❌ 載入失敗: {e}"
+            return f"❌ 載入失敗: {e}"
 
     # ── 文本分割 ──────────────────────────────────────────
+
     @staticmethod
     def _split_text(text: str, chunk_size: int, overlap: int) -> list[str]:
+        """依句子邊界分割文本，避免截斷語意"""
+        # 先按段落粗分
         paragraphs = re.split(r"\n{2,}", text)
         merged = []
         buffer = ""
@@ -133,7 +141,9 @@ class MultiStrategyRAG:
             else:
                 if buffer:
                     merged.append(buffer)
+                # 若單一段落超過 chunk_size，則強制切割
                 while len(para) > chunk_size:
+                    # 嘗試在句號處切割
                     cut = para[:chunk_size].rfind("。")
                     if cut == -1:
                         cut = para[:chunk_size].rfind(". ")
@@ -148,9 +158,10 @@ class MultiStrategyRAG:
         if buffer:
             merged.append(buffer)
 
-        return [c for c in merged if len(c) > 20]
+        return [c for c in merged if len(c) > 20]  # 過濾過短片段
 
-    # ── LLM 呼叫 ──────────────────────────────────────────
+    # ── LLM 呼叫（統一封裝） ─────────────────────────────
+
     def _llm_call(self, prompt: str, system: str = "", max_tokens: int = 200,
                   temperature: float = 0.3) -> str:
         messages = []
@@ -166,12 +177,14 @@ class MultiStrategyRAG:
         )
         return response.choices[0].message.content.strip()
 
-    # ── 向量搜尋 ──────────────────────────────────────────
+    # ── 向量搜尋（共用） ─────────────────────────────────
+
     def _vector_search(self, query_text: str, top_k: int,
                        index: faiss.IndexFlatIP = None,
                        chunks: list[str] = None) -> list[tuple[int, float, str]]:
-        index = index if index is not None else self.index
-        chunks = chunks if chunks is not None else self.chunks
+        """回傳 [(index, score, chunk), ...]"""
+        index = index or self.index
+        chunks = chunks or self.chunks
 
         query_vec = self.embedding_model.encode([query_text], convert_to_numpy=True)
         query_vec = normalize(query_vec, norm="l2").astype("float32")
@@ -184,21 +197,28 @@ class MultiStrategyRAG:
         return results
 
     # ==================== 8 種 RAG 策略 ====================
+
     def strategy_1_basic_similarity(self, query: str, top_k: int = 3) -> list[str]:
+        """策略1: 基礎語意相似度搜尋"""
         results = self._vector_search(query, top_k)
         return [chunk for _, _, chunk in results]
 
     def strategy_2_tfidf(self, query: str, top_k: int = 3) -> list[str]:
+        """策略2: TF-IDF 關鍵詞搜尋"""
         query_vec = self.tfidf_vectorizer.transform([query])
         similarities = (self.tfidf_matrix @ query_vec.T).toarray().flatten()
         top_indices = similarities.argsort()[-top_k:][::-1]
         return [self.chunks[idx] for idx in top_indices if similarities[idx] > 0]
 
     def strategy_3_hybrid(self, query: str, top_k: int = 3) -> list[str]:
-        k_rrf = 60
+        """策略3: 混合搜尋 — RRF (Reciprocal Rank Fusion)"""
+        k_rrf = 60  # RRF 常數
+
+        # 語意排名
         sem_results = self._vector_search(query, top_k=min(top_k * 3, len(self.chunks)))
         sem_ranking = {idx: rank for rank, (idx, _, _) in enumerate(sem_results)}
 
+        # TF-IDF 排名
         query_vec = self.tfidf_vectorizer.transform([query])
         tfidf_scores = (self.tfidf_matrix @ query_vec.T).toarray().flatten()
         tfidf_ranking = {
@@ -206,6 +226,7 @@ class MultiStrategyRAG:
             for rank, idx in enumerate(tfidf_scores.argsort()[::-1][:top_k * 3])
         }
 
+        # RRF 融合
         all_indices = set(sem_ranking.keys()) | set(tfidf_ranking.keys())
         rrf_scores = {}
         for idx in all_indices:
@@ -220,6 +241,7 @@ class MultiStrategyRAG:
         return [self.chunks[idx] for idx in sorted_indices[:top_k]]
 
     def strategy_4_reranking(self, query: str, top_k: int = 3) -> list[str]:
+        """策略4: LLM 重新排序"""
         candidates = self.strategy_1_basic_similarity(query, top_k=top_k * 2)
 
         prompt = (
@@ -233,11 +255,13 @@ class MultiStrategyRAG:
         try:
             result = self._llm_call(prompt, max_tokens=50, temperature=0)
             numbers = [int(n) - 1 for n in re.findall(r"\d+", result)]
-            reranked, seen = [], set()
+            reranked = []
+            seen = set()
             for n in numbers:
                 if 0 <= n < len(candidates) and n not in seen:
                     reranked.append(candidates[n])
                     seen.add(n)
+            # 補齊未被排到的
             for i, c in enumerate(candidates):
                 if i not in seen:
                     reranked.append(c)
@@ -247,6 +271,7 @@ class MultiStrategyRAG:
             return candidates[:top_k]
 
     def strategy_5_multi_query(self, query: str, top_k: int = 3) -> list[str]:
+        """策略5: 多查詢擴展"""
         expansion_prompt = (
             f"請將以下問題改寫成 3 個不同角度的問題，每行一個，不要編號：\n{query}"
         )
@@ -254,12 +279,14 @@ class MultiStrategyRAG:
             result = self._llm_call(expansion_prompt, max_tokens=200, temperature=0.7)
             extra_queries = [
                 q.strip().lstrip("0123456789.、-）) ")
-                for q in result.split("\n") if q.strip()
+                for q in result.split("\n")
+                if q.strip()
             ][:3]
             queries = [query] + extra_queries
         except Exception:
             queries = [query]
 
+        # 對每個查詢搜尋，用 RRF 融合
         chunk_scores: dict[int, float] = {}
         k_rrf = 60
         for q in queries:
@@ -271,21 +298,26 @@ class MultiStrategyRAG:
         return [self.chunks[idx] for idx in sorted_indices[:top_k]]
 
     def strategy_6_contextual_compression(self, query: str, top_k: int = 3) -> list[str]:
+        """策略6: 上下文壓縮"""
         chunks = self.strategy_1_basic_similarity(query, top_k=top_k)
+
         compressed = []
         for chunk in chunks:
             try:
                 result = self._llm_call(
                     f"從以下文本中，提取與問題「{query}」最直接相關的 1-3 句話。"
                     f"只輸出提取結果，不要加任何說明：\n\n{chunk}",
-                    max_tokens=200, temperature=0,
+                    max_tokens=200,
+                    temperature=0,
                 )
                 compressed.append(result if result else chunk[:300])
             except Exception:
                 compressed.append(chunk[:300])
+
         return compressed
 
     def strategy_7_parent_child(self, query: str, top_k: int = 3) -> list[str]:
+        """策略7: 父子文檔（小片段檢索 → 大上下文回傳）"""
         full_text = " ".join(self.chunks)
         small_chunks = self._split_text(full_text, SMALL_CHUNK_SIZE, SMALL_CHUNK_OVERLAP)
 
@@ -298,10 +330,11 @@ class MultiStrategyRAG:
         small_index = faiss.IndexFlatIP(small_embeddings.shape[1])
         small_index.add(small_embeddings)
 
-        results = self._vector_search(query, top_k=top_k * 2,
-                                      index=small_index, chunks=small_chunks)
+        results = self._vector_search(query, top_k=top_k * 2, index=small_index, chunks=small_chunks)
 
-        parent_chunks, seen = [], set()
+        # 映射回原始大片段
+        parent_chunks = []
+        seen = set()
         for _, _, small_chunk in results:
             for i, big_chunk in enumerate(self.chunks):
                 if i not in seen and small_chunk[:50] in big_chunk:
@@ -314,10 +347,12 @@ class MultiStrategyRAG:
         return parent_chunks if parent_chunks else self.strategy_1_basic_similarity(query, top_k)
 
     def strategy_8_hypothetical_answer(self, query: str, top_k: int = 3) -> list[str]:
+        """策略8: HyDE — 假設性文檔嵌入"""
         try:
             hypothetical = self._llm_call(
                 f"請針對以下問題，寫一段可能出現在文件中的回答段落（約 100 字）：\n{query}",
-                max_tokens=200, temperature=0.7,
+                max_tokens=200,
+                temperature=0.7,
             )
         except Exception:
             hypothetical = query
@@ -325,7 +360,8 @@ class MultiStrategyRAG:
         results = self._vector_search(hypothetical, top_k)
         return [chunk for _, _, chunk in results]
 
-    # ── 主流程 ────────────────────────────────────────────
+    # ── 主流程：生成答案 ─────────────────────────────────
+
     STRATEGY_MAP = {
         "1. 基礎語意搜尋": "strategy_1_basic_similarity",
         "2. TF-IDF 關鍵詞": "strategy_2_tfidf",
@@ -339,11 +375,11 @@ class MultiStrategyRAG:
 
     def generate_answer(self, query: str, strategy: str, top_k: int = 3):
         if not self.client:
-            return None, None, "❌ 請先設定 API Key！"
+            return "❌ 請先設定 API Key！", ""
         if not self.pdf_loaded:
-            return None, None, "❌ 請先上傳 PDF 檔案！"
+            return "❌ 請先上傳 PDF 檔案！", ""
         if not query.strip():
-            return None, None, "⚠️ 請輸入問題"
+            return "⚠️ 請輸入問題", ""
 
         try:
             method_name = self.STRATEGY_MAP.get(strategy, "strategy_1_basic_similarity")
@@ -351,9 +387,10 @@ class MultiStrategyRAG:
             relevant_chunks = retrieval_func(query, int(top_k))
 
             if not relevant_chunks:
-                return None, None, "⚠️ 未檢索到相關片段，請嘗試其他策略或調整 Top-K"
+                return "⚠️ 未檢索到相關片段，請嘗試其他策略或調整 Top-K", ""
 
             context = "\n\n---\n\n".join(relevant_chunks)
+
             answer = self._llm_call(
                 prompt=(
                     f"請根據以下上下文回答問題。如果上下文中沒有相關資訊，請明確說明。\n\n"
@@ -363,211 +400,138 @@ class MultiStrategyRAG:
                 max_tokens=1024,
                 temperature=0.3,
             )
-            return answer, relevant_chunks, None
+
+            source_info = (
+                f"📚 使用策略：{strategy}\n"
+                f"📄 檢索片段數：{len(relevant_chunks)}\n\n"
+                f"{'=' * 50}\n相關文本片段：\n{'=' * 50}\n\n{context}"
+            )
+
+            return answer, source_info
 
         except Exception as e:
             logger.exception("生成答案失敗")
-            return None, None, f"❌ 生成答案失敗: {e}"
+            return f"❌ 生成答案失敗: {e}", ""
 
 
 # ══════════════════════════════════════════════════════════
-#  Streamlit UI
+#  Gradio 介面
 # ══════════════════════════════════════════════════════════
-def init_session_state():
-    if "rag" not in st.session_state:
-        st.session_state.rag = MultiStrategyRAG()
-    if "api_key_ok" not in st.session_state:
-        st.session_state.api_key_ok = False
-    if "pdf_ok" not in st.session_state:
-        st.session_state.pdf_ok = False
-    if "history" not in st.session_state:
-        st.session_state.history = []
 
+def create_interface():
+    rag = MultiStrategyRAG()
 
-def render_sidebar():
-    rag: MultiStrategyRAG = st.session_state.rag
+    def set_key(api_key: str) -> str:
+        return rag.set_api_key(api_key)
 
-    with st.sidebar:
-        st.header("⚙️ 系統設定")
+    def upload_pdf(file) -> str:
+        if file is None:
+            return "⚠️ 請選擇 PDF 檔案"
+        return rag.load_pdf(file.name)
 
-        # ── 1. API Key ──
-        st.subheader("🔑 步驟 1: Groq API Key")
-        api_key = st.text_input(
-            "API Key",
-            type="password",
-            placeholder="gsk_...",
-            label_visibility="collapsed",
+    def ask_question(query, strategy, top_k):
+        return rag.generate_answer(query, strategy, int(top_k))
+
+    strategy_choices = list(MultiStrategyRAG.STRATEGY_MAP.keys())
+
+    with gr.Blocks(title="🤖 多策略 RAG PDF 問答系統", theme=gr.themes.Soft()) as demo:
+        gr.Markdown(
+            "# 🤖 多策略 RAG PDF 問答系統\n"
+            "採用 **8 種不同的 RAG 策略**，為您的 PDF 文件提供智能問答服務！"
         )
-        if st.button("驗證 API Key", use_container_width=True):
-            if api_key:
-                with st.spinner("驗證中…"):
-                    ok, msg = rag.set_api_key(api_key)
-                st.session_state.api_key_ok = ok
-                (st.success if ok else st.error)(msg)
-            else:
-                st.warning("請先輸入 API Key")
 
-        if st.session_state.api_key_ok:
-            st.caption("🟢 API Key 已驗證")
-        else:
-            st.caption("🔴 尚未驗證 API Key")
+        # ── API Key ──
+        with gr.Row():
+            api_key_input = gr.Textbox(
+                label="🔑 Groq API Key",
+                placeholder="gsk_...",
+                type="password",
+                scale=3,
+            )
+            api_key_btn = gr.Button("驗證 Key", variant="secondary", scale=1)
+            api_key_status = gr.Textbox(label="狀態", interactive=False, scale=2)
 
-        st.divider()
+        api_key_btn.click(fn=set_key, inputs=[api_key_input], outputs=[api_key_status])
 
-        # ── 2. PDF 上傳 ──
-        st.subheader("📤 步驟 2: 上傳 PDF")
-        uploaded_pdf = st.file_uploader(
-            "選擇 PDF 檔案",
-            type=["pdf"],
-            label_visibility="collapsed",
-        )
-        if st.button("🚀 載入文件", use_container_width=True, type="primary"):
-            if uploaded_pdf is None:
-                st.warning("請先選擇 PDF 檔案")
-            elif not st.session_state.api_key_ok:
-                st.warning("請先驗證 API Key")
-            else:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                    tmp.write(uploaded_pdf.read())
-                    tmp_path = tmp.name
-                with st.status("處理中…", expanded=True) as status:
-                    st.write("📖 解析 PDF…")
-                    st.write("✂️ 分割文本…")
-                    st.write("🧠 生成嵌入向量…")
-                    ok, msg = rag.load_pdf(tmp_path)
-                    status.update(
-                        label=msg,
-                        state="complete" if ok else "error",
-                        expanded=False,
+        gr.Markdown("---")
+
+        with gr.Row():
+            # ── 左側面板 ──
+            with gr.Column(scale=1):
+                gr.Markdown("### 📤 步驟 1: 上傳 PDF")
+                pdf_input = gr.File(label="選擇 PDF 檔案", file_types=[".pdf"])
+                upload_btn = gr.Button("🚀 載入文件", variant="primary")
+                upload_status = gr.Textbox(label="載入狀態", interactive=False)
+
+                gr.Markdown("### ⚙️ 步驟 2: 選擇 RAG 策略")
+                strategy_dropdown = gr.Dropdown(
+                    choices=strategy_choices,
+                    value=strategy_choices[0],
+                    label="RAG 策略",
+                )
+                top_k_slider = gr.Slider(
+                    minimum=1, maximum=10, value=3, step=1,
+                    label="檢索片段數量 (Top-K)",
+                )
+
+                gr.Markdown("""
+### 📖 策略說明
+| # | 策略 | 特點 |
+|---|------|------|
+| 1 | 基礎語意搜尋 | 快速、通用 |
+| 2 | TF-IDF 關鍵詞 | 精確匹配專有名詞 |
+| 3 | 混合搜尋 (RRF) | 兼顧語意與關鍵詞 |
+| 4 | 重新排序 | LLM 精排，品質最高 |
+| 5 | 多查詢擴展 | 覆蓋面廣 |
+| 6 | 上下文壓縮 | 精簡雜訊 |
+| 7 | 父子文檔 | 精準定位 + 完整上下文 |
+| 8 | HyDE | 適合探索性問題 |
+                """)
+
+            # ── 右側面板 ──
+            with gr.Column(scale=2):
+                gr.Markdown("### 💬 步驟 3: 提問")
+                question_input = gr.Textbox(
+                    label="輸入您的問題",
+                    placeholder="例如：這份文件的主要內容是什麼？",
+                    lines=3,
+                )
+                ask_btn = gr.Button("🔍 提問", variant="primary", size="lg")
+
+                gr.Markdown("### 💡 答案")
+                answer_output = gr.Textbox(label="AI 回答", lines=10, interactive=False)
+
+                with gr.Accordion("📚 查看檢索到的文本片段", open=False):
+                    source_output = gr.Textbox(
+                        label="相關來源", lines=15, interactive=False
                     )
-                st.session_state.pdf_ok = ok
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
 
-        if st.session_state.pdf_ok:
-            st.caption(f"🟢 已載入 {len(rag.chunks)} 個片段")
-        else:
-            st.caption("🔴 尚未載入 PDF")
-
-        st.divider()
-
-        # ── 3. 策略設定 ──
-        st.subheader("🎯 步驟 3: 策略設定")
-        strategy = st.selectbox(
-            "RAG 策略",
-            options=list(MultiStrategyRAG.STRATEGY_MAP.keys()),
-            index=0,
+        # ── 事件綁定 ──
+        upload_btn.click(fn=upload_pdf, inputs=[pdf_input], outputs=[upload_status])
+        ask_btn.click(
+            fn=ask_question,
+            inputs=[question_input, strategy_dropdown, top_k_slider],
+            outputs=[answer_output, source_output],
         )
-        top_k = st.slider("檢索片段數量 (Top-K)", 1, 10, 3)
-
-        st.divider()
-
-        if st.button("🗑️ 清除對話歷史", use_container_width=True):
-            st.session_state.history = []
-            st.rerun()
-
-    return strategy, top_k
-
-
-def render_strategy_table():
-    with st.expander("📖 8 種 RAG 策略說明", expanded=False):
-        st.markdown(
-            """
-| # | 策略 | 特點 | 適用場景 |
-|---|------|------|---------|
-| 1 | 基礎語意搜尋 | 快速、通用 | 一般性問答 |
-| 2 | TF-IDF 關鍵詞 | 精確匹配專有名詞 | 查找具體術語 |
-| 3 | 混合搜尋 (RRF) | 兼顧語意與關鍵詞 | 平衡型查詢 |
-| 4 | 重新排序 | LLM 精排，品質最高 | 對精度要求高 |
-| 5 | 多查詢擴展 | 覆蓋面廣 | 模糊問題 |
-| 6 | 上下文壓縮 | 精簡雜訊 | 長文件處理 |
-| 7 | 父子文檔 | 精準定位 + 完整上下文 | 結構化文檔 |
-| 8 | HyDE | 假設性答案嵌入 | 探索性問題 |
-            """
+        question_input.submit(
+            fn=ask_question,
+            inputs=[question_input, strategy_dropdown, top_k_slider],
+            outputs=[answer_output, source_output],
         )
 
+        gr.Examples(
+            examples=[
+                ["這份文件的主要內容是什麼？"],
+                ["文件中提到哪些重要概念？"],
+                ["有哪些關鍵數據或統計資料？"],
+                ["文件的結論是什麼？"],
+            ],
+            inputs=question_input,
+        )
 
-def render_main(strategy: str, top_k: int):
-    st.title("🤖 多策略 RAG PDF 問答系統")
-    st.caption("採用 **8 種不同的 RAG 策略**，為您的 PDF 文件提供智能問答服務")
-
-    render_strategy_table()
-
-    # 範例問題
-    st.markdown("##### 💡 範例問題")
-    example_cols = st.columns(4)
-    examples = [
-        "這份文件的主要內容是什麼？",
-        "文件中提到哪些重要概念？",
-        "有哪些關鍵數據或統計資料？",
-        "文件的結論是什麼？",
-    ]
-    for col, ex in zip(example_cols, examples):
-        if col.button(ex, use_container_width=True, key=f"ex_{ex}"):
-            st.session_state.pending_query = ex
-
-    # 對話歷史
-    for item in st.session_state.history:
-        with st.chat_message("user"):
-            st.markdown(item["query"])
-        with st.chat_message("assistant"):
-            st.markdown(item["answer"])
-            with st.expander(
-                f"📚 檢索來源（策略：{item['strategy']}，{len(item['chunks'])} 片段）"
-            ):
-                for i, chunk in enumerate(item["chunks"], 1):
-                    st.markdown(f"**片段 {i}**")
-                    st.text(chunk)
-                    st.divider()
-
-    # 輸入框
-    pending = st.session_state.pop("pending_query", None)
-    query = st.chat_input("輸入您的問題…")
-    if pending and not query:
-        query = pending
-
-    if query:
-        with st.chat_message("user"):
-            st.markdown(query)
-
-        with st.chat_message("assistant"):
-            with st.spinner(f"使用「{strategy}」檢索並生成答案中…"):
-                rag: MultiStrategyRAG = st.session_state.rag
-                answer, chunks, error = rag.generate_answer(query, strategy, top_k)
-
-            if error:
-                st.error(error)
-            else:
-                st.markdown(answer)
-                with st.expander(
-                    f"📚 檢索來源（策略：{strategy}，{len(chunks)} 片段）"
-                ):
-                    for i, chunk in enumerate(chunks, 1):
-                        st.markdown(f"**片段 {i}**")
-                        st.text(chunk)
-                        st.divider()
-
-                st.session_state.history.append({
-                    "query": query,
-                    "answer": answer,
-                    "chunks": chunks,
-                    "strategy": strategy,
-                })
-
-
-def main():
-    st.set_page_config(
-        page_title="多策略 RAG PDF 問答",
-        page_icon="🤖",
-        layout="wide",
-        initial_sidebar_state="expanded",
-    )
-    init_session_state()
-    strategy, top_k = render_sidebar()
-    render_main(strategy, top_k)
+    return demo
 
 
 if __name__ == "__main__":
-    main()
+    demo = create_interface()
+    demo.launch(share=True, server_name="0.0.0.0")
